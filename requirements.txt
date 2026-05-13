@@ -1,0 +1,23 @@
+# Web Framework & Server
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+# LangChain Ecosystem
+langchain-core
+langchain-community
+langchain-ollama
+langchain-chroma
+langchain-text-splitters
+
+# Document Processing & Loaders
+PyMuPDF
+docx2txt
+unstructured
+python-pptx
+openpyxl
+
+# Search & Cloud Services
+rank_bm25
+boto3

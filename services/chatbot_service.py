@@ -1,0 +1,352 @@
+from datetime import datetime
+import traceback
+import os, re, json, time, math, uuid, asyncio, hashlib
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+from fastapi import FastAPI, HTTPException
+
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    TextLoader,
+    Docx2txtLoader,
+    UnstructuredPowerPointLoader,
+    UnstructuredExcelLoader
+)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores.utils import filter_complex_metadata
+
+from core.config import *
+from schemas.dto import ChatRequest, ChatResponse, SourceInfo, IngestRequest
+
+try:
+    from langchain_community.retrievers import BM25Retriever
+except Exception:
+    BM25Retriever = None
+try:
+    import boto3
+except Exception:
+    boto3 = None
+
+
+# --- 유틸리티 함수 ---
+def preprocess_text(text: str) -> str:
+    """텍스트 내의 불필요한 공백 및 줄바꿈을 제거합니다."""
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+def is_korean(text: str) -> bool:
+    """주어진 텍스트에 한글이 포함되어 있는지 확인합니다."""
+    return any(("\uAC00" <= c <= "\uD7A3") or ("\u1100" <= c <= "\u11FF") or ("\u3130" <= c <= "\u318F") for c in (text or ""))
+
+def sanitize_metadata(meta: dict) -> dict:
+    """벡터 저장소와 호환되도록 메타데이터 값을 정리합니다."""
+    clean = {}
+    for k, v in (meta or {}).items():
+        if v is None: continue
+        if isinstance(v, (str, int, float, bool)): clean[k] = v
+        else: clean[k] = str(v)
+    return clean
+
+def split_semantic_then_fallback(docs: List[Document]) -> List[Document]:
+    """임베딩을 위해 RecursiveCharacterTextSplitter를 사용하여 문서를 적절한 크기의 청크로 분할합니다."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    return splitter.split_documents(docs)
+
+def build_context(docs: List[Document], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    """검색된 문서 청크들을 하나의 컨텍스트 문자열로 병합합니다 (최대 글자 수 제한)."""
+    parts, total = [], 0
+    for d in docs:
+        text = (d.page_content or "").strip()
+        if not text: continue
+        if total + len(text) > max_chars:
+            remain = max_chars - total
+            if remain > 200: parts.append(text[:remain])
+            break
+        parts.append(text)
+        total += len(text)
+    return "\n\n---\n\n".join(parts)
+
+def cosine(a: List[float], b: List[float]) -> float:
+    """두 벡터 간의 코사인 유사도를 계산합니다."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb + 1e-12)
+
+def rerank_by_embedding(query: str, docs: List[Document], top_k: int, threshold: float = 0.60) -> List[Document]:
+    """검색된 문서들을 쿼리 임베딩과의 정확한 코사인 유사도를 기준으로 재정렬(Reranking)합니다."""
+    if not docs: return []
+    q = embedding_model.embed_query(query)
+    doc_vecs, texts, batch_size = [], [(d.page_content or "") for d in docs], 10
+    for i in range(0, len(texts), batch_size):
+        doc_vecs.extend(embedding_model.embed_documents(texts[i : i + batch_size]))
+
+    # 쿼리와 청크 간의 유사도 점수(0.0 ~ 1.0)를 계산
+    scored = [(cosine(q, v), d) for v, d in zip(doc_vecs, docs)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # top_k 개수 안에서 자르되, 점수가 threshold 이상인 것만 필터링
+    return [d for score, d in scored[:top_k] if score >= threshold]
+
+def stable_doc_id(source_uri: str, space_id: str) -> str:
+    """문서 URI와 space_id를 기반으로 고유하고 안정적인 문서 ID를 생성합니다."""
+    return hashlib.sha1(f"{space_id}::{source_uri}".encode("utf-8")).hexdigest()
+
+def file_sha256(path: str) -> str:
+    """파일의 SHA-256 해시값을 계산합니다."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""): sha.update(chunk)
+    return sha.hexdigest()
+
+def load_state() -> dict:
+    """인덱싱된 파일 상태를 JSON 파일에서 불러옵니다."""
+    try:
+        with open(INDEX_STATE_PATH, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return {"files": {}}
+
+def save_state(state: dict) -> None:
+    """현재 인덱싱 상태를 JSON 파일에 안전하게 저장합니다."""
+    ensure_dir(os.path.dirname(INDEX_STATE_PATH) or ".")
+    tmp = INDEX_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, INDEX_STATE_PATH)
+
+def supported_ext(name: str) -> bool:
+    """주어진 파일명이 시스템에서 지원하는 확장자인지 확인합니다."""
+    nl = (name or "").lower()
+    return nl.endswith((".pdf", ".txt", ".md", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"))
+
+def load_and_chunk_from_path(path: str, source_label: str, space_id: str, doc_id: str) -> List[Document]:
+    """경로에서 문서를 로드하고 전처리한 뒤 청크로 분할합니다."""
+    ext = os.path.splitext(path)[1].lower()
+
+    docs = []
+    try:
+        if ext == ".pdf":
+            docs = PyMuPDFLoader(path).load()
+        elif ext in [".txt", ".md"]:
+            raw = TextLoader(path, encoding="utf-8").load()[0].page_content
+            docs = [Document(page_content=raw, metadata={"source": source_label})]
+        elif ext in [".docx", ".doc"]:
+            docs = Docx2txtLoader(path).load()
+        elif ext in [".pptx", ".ppt"]:
+            docs = UnstructuredPowerPointLoader(path).load()
+        elif ext in [".xlsx", ".xls"]:
+            docs = UnstructuredExcelLoader(path).load()
+        else:
+            return []
+    except Exception as e:
+        print(f"문서 파싱 에러 ({ext}): {e}")
+        return []
+
+    # 파싱된 텍스트 공통 전처리 및 메타데이터 주입
+    for d in docs:
+        d.page_content = preprocess_text(d.page_content)
+        d.metadata = d.metadata or {}
+        d.metadata["source"] = source_label
+
+    chunks = split_semantic_then_fallback(docs)
+
+    cleaned = []
+    for i, d in enumerate(chunks):
+        if not d.page_content or not d.page_content.strip():
+          continue
+        d.metadata = d.metadata or {}
+        d.metadata.update({"doc_id": doc_id, "chunk_index": i, "source": source_label, "space_id": space_id})
+        d.metadata = sanitize_metadata(d.metadata)
+        cleaned.append(d)
+    return filter_complex_metadata(cleaned)
+
+async def rebuild_bm25(app: FastAPI, space_id: str = DEFAULT_SPACE_ID) -> None:
+    """희소 검색(Sparse Retrieval)을 위해 벡터 데이터베이스 기반으로 BM25 인덱스를 재구축합니다."""
+    if not ENABLE_BM25 or BM25Retriever is None:
+        app.state.bm25 = None
+        return
+    raw = app.state.vectordb._collection.get(where={"space_id": space_id}, include=["documents", "metadatas"])
+    docs = [Document(page_content=t, metadata=(m or {})) for t, m in zip(raw.get("documents", []), raw.get("metadatas", [])) if t and t.strip()]
+    if docs:
+        bm25 = BM25Retriever.from_documents(docs)
+        bm25.k = K_SPARSE
+        app.state.bm25 = bm25
+    else: app.state.bm25 = None
+
+
+# --- 자동 인덱싱 로직 ---
+@dataclass(frozen=True)
+class IndexItem:
+    uri: str
+    label: str
+    local_path: str
+    fingerprint: str
+
+def list_local_items(space_id: str) -> List[IndexItem]:
+    """로컬 디렉토리를 스캔하여 인덱싱할 지원 문서를 찾습니다."""
+    items = []
+    for root in LOCAL_SOURCES:
+        full_root = os.path.join("/content", root) if not root.startswith("/") else root
+        if not full_root or not os.path.exists(full_root): continue
+
+        for dirpath, _, filenames in os.walk(full_root):
+            for fn in filenames:
+                if not supported_ext(fn): continue
+                path = os.path.join(dirpath, fn)
+                items.append(IndexItem(uri=f"file://{os.path.abspath(path)}", label=path, local_path=path, fingerprint=f"sha256:{file_sha256(path)}"))
+    return items
+
+def list_s3_items(space_id: str) -> List[IndexItem]:
+    """AWS S3 저장소를 스캔하여 인덱싱할 문서를 찾습니다."""
+    if not (S3_BUCKET and S3_PREFIXES) or boto3 is None: return []
+    ensure_dir(TMP_DIR)
+    s3, out = boto3.session.Session(region_name=S3_REGION or None).client("s3"), []
+    for prefix in S3_PREFIXES:
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if not supported_ext(obj["Key"]): continue
+
+                # f-string 에러를 피하기 위해 ETag를 밖에서 처리
+                raw_etag = (obj.get('ETag') or '').strip('"')
+                fp = f"etag:{raw_etag};lm:{obj.get('LastModified')}"
+                local_path = os.path.join(TMP_DIR, uuid.uuid4().hex + os.path.splitext(obj["Key"])[1].lower())
+
+                s3.download_file(S3_BUCKET, obj["Key"], local_path)
+                out.append(IndexItem(uri=f"s3://{S3_BUCKET}/{obj['Key']}", label=f"s3://{S3_BUCKET}/{obj['Key']}", local_path=local_path, fingerprint=fp))
+    return out
+
+async def sync_once(app: FastAPI, space_id: str = DEFAULT_SPACE_ID) -> Tuple[int, int, int]:
+    """로컬 및 S3 파일들과 벡터 데이터베이스를 동기화합니다 (1회 실행)."""
+    vectordb, state = app.state.vectordb, load_state()
+    known, items = state.get("files", {}), list_local_items(space_id) + list_s3_items(space_id)
+    seen_uris, added, removed = {it.uri for it in items}, 0, 0
+
+    missing = [uri for uri in list(known.keys()) if uri not in seen_uris]
+    if missing:
+        async with app.state.write_lock:
+            for uri in missing:
+                if doc_id := known[uri].get("doc_id"):
+                    if ids := vectordb._collection.get(where={"doc_id": doc_id}).get("ids", []): vectordb._collection.delete(ids=ids)
+                known.pop(uri, None)
+                removed += 1
+
+    for it in items:
+        if (prev := known.get(it.uri)) and prev.get("fingerprint") == it.fingerprint: continue
+        doc_id = stable_doc_id(it.uri, space_id)
+        try:
+            chunks = load_and_chunk_from_path(it.local_path, it.label, space_id, doc_id)
+            if not chunks: continue
+            async with app.state.write_lock:
+                if old_ids := vectordb._collection.get(where={"doc_id": doc_id}).get("ids", []): vectordb._collection.delete(ids=old_ids)
+                vectordb.add_documents(chunks)
+            known[it.uri] = {"fingerprint": it.fingerprint, "doc_id": doc_id, "label": it.label, "space_id": space_id, "indexed_at": time.time()}
+            added += 1
+        finally:
+            if it.uri.startswith("s3://"):
+                try: os.remove(it.local_path)
+                except Exception: pass
+
+    state["files"] = known
+    save_state(state)
+    async with app.state.rebuild_lock: await rebuild_bm25(app, space_id=space_id)
+    return added, removed, len(items)
+
+async def periodic_sync(app: FastAPI) -> None:
+    """백그라운드에서 주기적으로 벡터 데이터베이스를 동기화합니다."""
+    while not app.state.stop_event.is_set():
+        try: await sync_once(app, space_id=DEFAULT_SPACE_ID)
+        except Exception as e: print(f"!! 인덱서 에러: {e}")
+        await asyncio.sleep(INDEX_POLL_SECONDS)
+
+
+# --- 서비스 계층 로직 (컨트롤러에서 호출됨) ---
+async def process_chat(req: ChatRequest, app: FastAPI) -> ChatResponse:
+    """채팅 요청을 처리하여 관련된 문서를 검색하고 답변을 생성합니다."""
+    vectordb, bm25 = app.state.vectordb, getattr(app.state, "bm25", None)
+    q = (req.question or "").strip()
+    if not q: raise HTTPException(status_code=400, detail="question is required")
+
+    space_id = (req.space_id or DEFAULT_SPACE_ID).strip() or DEFAULT_SPACE_ID
+    answer_language = "Korean" if is_korean(q) else "English"
+
+    dense_search_type = "mmr" if len(q) >= 12 else "similarity"
+    dense_kwargs = {"k": K_DENSE, "fetch_k": FETCH_K, "lambda_mult": LAMBDA_MULT} if dense_search_type == "mmr" else {"k": K_DENSE}
+    dense_kwargs["filter"] = {"space_id": space_id}
+
+    retriever = vectordb.as_retriever(search_type=dense_search_type, search_kwargs=dense_kwargs)
+    candidates = list(await asyncio.to_thread(retriever.invoke, q))
+
+    if ENABLE_BM25 and bm25 is not None:
+        try:
+            bm25.k = K_SPARSE
+            seen = {d.metadata.get("doc_id", "") + ":" + str(d.metadata.get("chunk_index", "")) for d in candidates}
+            for d in await asyncio.to_thread(bm25.invoke, q):
+                if (d.metadata or {}).get("space_id") != space_id: continue
+                key = d.metadata.get("doc_id", "") + ":" + str(d.metadata.get("chunk_index", ""))
+                if key not in seen:
+                    candidates.append(d)
+                    seen.add(key)
+        except Exception: pass
+
+    final_docs = await asyncio.to_thread(rerank_by_embedding, q, candidates, K_FINAL, 0.60)
+
+    if not final_docs:
+        answer = "관련 자료에서 답을 찾지 못했습니다." if answer_language == "Korean" else "I don't have information about that."
+        return ChatResponse(answer=answer, sources=[])
+
+    context = build_context(final_docs, max_chars=MAX_CONTEXT_CHARS)
+    chain = BASE_PROMPT | llm | StrOutputParser()
+    answer = (await chain.ainvoke({"context": context, "question": q, "answer_language": answer_language}) or "").strip()
+
+    sources = []
+    no_answer_keywords = [
+        "관련 자료에서 답을 찾지", "관련 자료에서", "정보를 가지고 있지 않", "정보가 없습니다",
+        "해당 정보", "알 수 없습니다", "언급되어 있지 않", "제공된 내용", "제공되지 않",
+        "내용이 없습니다", "답변할 수 없", "I don't have information", "don't have that information",
+        "not in the context", "안녕", "알겠", "반갑", "다행"
+    ]
+    
+    if not any(keyword in answer for keyword in no_answer_keywords):
+        seen_sources = set()
+        for d in final_docs:
+            meta = d.metadata or {}
+            source_name = meta.get("source", "unknown")
+            page_num = meta.get("page")
+            page_val = int(page_num) + 1 if page_num is not None else None
+
+            uniq_key = f"{source_name}_{page_val}"
+            if uniq_key not in seen_sources:
+                sources.append(SourceInfo(source=source_name, page=page_val))
+                seen_sources.add(uniq_key)
+
+    return ChatResponse(answer=answer, sources=sources)
+
+async def process_ingest(file_path: str, space_id: str, app: FastAPI, user_id: str = "Unknown") -> dict:
+    """새로운 파일을 백그라운드에서 벡터 데이터베이스에 임베딩합니다."""
+    try:
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+        vectordb = app.state.vectordb
+        uri, source_label = f"file://{os.path.abspath(file_path)}", os.path.basename(file_path)
+        doc_id = stable_doc_id(uri, space_id)
+
+        chunks = await asyncio.to_thread(load_and_chunk_from_path, file_path, source_label, space_id, doc_id)
+
+        if not chunks: return {"status": "skipped", "message": "지원하지 않는 확장자이거나 추출할 텍스트가 없습니다."}
+
+        async with app.state.write_lock:
+            if old_ids := vectordb._collection.get(where={"doc_id": doc_id}).get("ids", []): vectordb._collection.delete(ids=old_ids)
+            batch_size = 20
+            for i in range(0, len(chunks), batch_size):
+                await asyncio.to_thread(vectordb.add_documents, chunks[i : i + batch_size])
+
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                current_chunk = min(i+batch_size, len(chunks))
+                print(f"[{now}] [User: {user_id} | Space: {space_id}] 임베딩 진행 중 ... ({current_chunk}/{len(chunks)})", flush=True)
+                await asyncio.sleep(0.1)
+
+        print(f"[{now}] [User: {user_id} | Space: {space_id}] 임베딩 완료", flush=True)
+        async with app.state.rebuild_lock: await rebuild_bm25(app, space_id=space_id)
+        return {"status": "success", "message": f"성공적으로 {len(chunks)}개의 청크를 DB에 추가했습니다.", "space_id": space_id}
+    except Exception as e:
+        print(f"백그라운드 임베딩 에러: {str(e)}", flush=True)
+        traceback.print_exc()
